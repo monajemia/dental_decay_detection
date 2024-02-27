@@ -15,24 +15,26 @@ import json
 from collections import OrderedDict
 import imageio.v2 as imageio
 import os
-import lightning as L
+import lightning as pl
 from lightning.pytorch.callbacks import early_stopping
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNN_ResNet50_FPN_Weights
 from torchvision.transforms import v2 as transforms
 from torchvision.utils import draw_bounding_boxes
 from torchvision.ops import box_area, box_iou
+import pickle
 import torchvision
 import numpy as np
 from matplotlib import pyplot as plt
 from torchvision.tv_tensors import BoundingBoxes
 import multiprocessing
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
 # Input Parameters (CHANGE)
 train_dir, train_json = 'train', 'train.json'
 val_dir, val_json = 'val', 'val.json'
 test_dir, test_json = 'test', 'test.json'
-num_classes = 6  # Output classes of objects to be predicted
+num_classes: int = 3  # Output classes of objects to be predicted; Either 3 or 6
 
 # Model Parameters
 mean, std = [0.485], [0.229]
@@ -43,22 +45,16 @@ lr = 1e-5
 num_workers = multiprocessing.cpu_count()
 
 default_root_dir = './'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Experiments:
-# - Adam or AdamW /etc.?
-# - Learning rate?
-# - Callback EarlyStopping is set to 95 patience!
-# - Data augmentation transforms
-#   - Which resolution to pass to model? Square it or keep original?
-# - Speed
-#   - Auto-scale batch size by growing it exponentially (not implemented)
-# - matmul precision to medium
+# Work in progress...
+# - mAP and other metrics calculation
 
 torch.set_float32_matmul_precision('medium')
 
 
 class DentalDataset(Dataset):
-    def __init__(self, images_dir, annotations_file, images_ext='.jpg', augmentation=False):
+    def __init__(self, images_dir, annotations_file, images_ext='.jpg', augmentation=False, num_classes=num_classes):
         with open(annotations_file) as f:
             annotations = json.load(f)
 
@@ -103,6 +99,40 @@ class DentalDataset(Dataset):
 
         # Preprocessing
         image, target = self.transform(image, target)
+
+        # Classes: 3 or 6; For better performance, sometimes need to choose 3 class, merging
+        new_labels = []
+        for label in target['labels']:
+            if label <= 3:
+                label = 1
+            elif label == 4:
+                label = 2
+            elif label > 4:
+                label = 3
+            new_labels.append(label)
+        target['labels'] = torch.tensor(new_labels)
+
+        return image, target
+
+    def get_image_by_id(self, image_id):
+        image = imageio.imread(os.path.join(self.images_dir,
+                                            image_id + self.images_ext))
+        target = self.image_annotations[image_id]
+
+        # Preprocessing
+        image, target = self.transform(image, target)
+
+        # Classes: 3 or 6; For better performance, sometimes need to choose 3 class, merging
+        new_labels = []
+        for label in target['labels']:
+            if label <= 3:
+                label = 1
+            elif label == 4:
+                label = 2
+            elif label > 4:
+                label = 3
+            new_labels.append(label)
+        target['labels'] = torch.tensor(new_labels)
 
         return image, target
 
@@ -149,7 +179,7 @@ class DentalDataset(Dataset):
         return image, target
 
 
-# Function later needed for dataloader   
+# Function later needed for dataloader
 # Default collate of DataLoader created extra dimension in my batch targets,
 # so I created a custom collate
 def custom_collate(batch):
@@ -175,11 +205,11 @@ train_loader = DataLoader(train_data, collate_fn=custom_collate, shuffle=True,
                           num_workers=num_workers, batch_size=batch_size)
 val_loader = DataLoader(val_data, collate_fn=custom_collate, shuffle=False,
                         num_workers=num_workers, batch_size=batch_size)
-test_loader = DataLoader(test_data, collate_fn=custom_collate, shuffle=True,
+test_loader = DataLoader(test_data, collate_fn=custom_collate, shuffle=False,
                          num_workers=num_workers, batch_size=batch_size)
 
 
-class FasterRCNNLightning(L.LightningModule):
+class FasterRCNNLightning(pl.LightningModule):
     def __init__(self, num_classes=num_classes, lr=lr, batch_size=batch_size):
         super().__init__()
         self.num_classes = num_classes
@@ -189,6 +219,7 @@ class FasterRCNNLightning(L.LightningModule):
         in_features = self.model.roi_heads.box_predictor.cls_score.in_features
         self.model.roi_heads.box_predictor = FastRCNNPredictor(in_features,
                                                                self.num_classes + 1)
+        self.mAP = MeanAveragePrecision(iou_thresholds=list(np.arange(0.0, 1.0, 0.1)))
 
     def training_step(self, batch, batch_idx):
         images, targets = batch
@@ -206,16 +237,15 @@ class FasterRCNNLightning(L.LightningModule):
         loss_dict = self.model(images, targets)
         losses = sum(loss for loss in loss_dict.values())
         self.log('val_loss', losses, batch_size=batch_size, prog_bar=True)
-        # Measure and log box_iou
+        # Back to eval?
         self.model.eval()
-        outputs = self.model(images)
-        val_iou_all = torch.tensor([])
-        for output, target in zip(outputs, targets):
-            val_iou = box_iou(target['boxes'], output['boxes']).mean().unsqueeze(0).to('cpu')
-            val_iou_all = torch.cat((val_iou_all, val_iou), 0)
-        val_iou_mean = val_iou_all.mean()
-        self.log('val_iou', val_iou_mean, batch_size=batch_size)
         return losses
+
+    def test_step(self, batch, batch_idx):
+        images, targets = batch
+        outputs = self(images)
+        # Test metrics
+        self.mAP.update(outputs, targets)
 
     def forward(self, images):
         return self.model(images)
@@ -231,91 +261,96 @@ class FasterRCNNLightning(L.LightningModule):
             return [optimizer]
 
 
-def visualize(image, boxes=None):
+def visualize(image, targets=None, preds=None, threshold=None):
+    image = image * std[0] + mean[0] # Un-normalize
     image = torch.as_tensor(image, dtype=torch.uint8)
     if image.ndim < 3:
         image = image.unsqueeze(0)
 
-    if boxes is not None:
-        image_to_show = draw_bounding_boxes(image, boxes)
+    if targets:
+        boxes, labels = targets['boxes'], targets['labels']
+        labels = [str(x.numpy()) for x in labels]
+        targets_to_show = draw_bounding_boxes(image, boxes=boxes, labels=labels)
+
+    if preds:
+        boxes, labels = preds['boxes'], preds['labels']
+        if threshold:
+            mask = preds['scores'] > threshold
+            boxes, labels = boxes[mask], labels[mask]
+            labels = [str(x.numpy()) for x in labels] # To string, for plot labels
+            preds_to_show = draw_bounding_boxes(image, boxes=boxes, labels=labels)
+        else:
+            labels = [str(x.numpy()) for x in labels]
+            preds_to_show = draw_bounding_boxes(image, boxes=boxes, labels=labels)
+
+    if targets and preds:
+        # Show image with targets labeled
+        targets_to_show = torch.as_tensor(targets_to_show, dtype=torch.float32)
+        targets_to_show = transforms.ToPILImage()(targets_to_show)
+        plt.subplot(1, 2, 1)
+        plt.ion()
+        plt.imshow(targets_to_show, cmap='gray')
+        plt.axis('off')
+        plt.title('Expert')
+        plt.show()
+        # Show image with predictions
+        preds_to_show = torch.as_tensor(preds_to_show, dtype=torch.float32)
+        preds_to_show = transforms.ToPILImage()(preds_to_show)
+        plt.subplot(1, 2, 2)
+        plt.ion()
+        plt.imshow(preds_to_show, cmap='gray')
+        plt.axis('off')
+        plt.title('AI Prediction')
+        plt.show()
+    elif targets:
+        # Show image with targets labeled
+        targets_to_show = torch.as_tensor(targets_to_show, dtype=torch.float32)
+        targets_to_show = transforms.ToPILImage()(targets_to_show)
+        plt.ion()
+        plt.imshow(targets_to_show, cmap='gray')
+        plt.axis('off')
+        plt.title('Expert')
+        plt.show()
+    elif preds:
+        # Show image with predictions
+        preds_to_show = torch.as_tensor(preds_to_show, dtype=torch.float32)
+        preds_to_show = transforms.ToPILImage()(preds_to_show)
+        plt.ion()
+        plt.imshow(preds_to_show, cmap='gray')
+        plt.axis('off')
+        plt.title('AI Prediction')
+        plt.show()
     else:
-        image_to_show = image
-
-    image_to_show = torch.as_tensor(image_to_show, dtype=torch.float32)
-    image_to_show = transforms.ToPILImage()(image_to_show)
-    plt.imshow(image_to_show)
-    plt.show()
-
+        image = torch.as_tensor(image, dtype=torch.float32)
+        image = transforms.ToPILImage()(image)
+        plt.ion()
+        plt.imshow(image, cmap='gray')
+        plt.axis('off')
+        plt.title('Input')
+        plt.show()
 
 model = FasterRCNNLightning()
 
 # Train the model
-if input('Train the model? [Y/n]: ').lower() != 'n':
+if input('Train the model? [y/N]: ').lower() == 'y':
     # Callbacks
     callbacks = [early_stopping.EarlyStopping(monitor='val_loss', mode='min', patience=30)]
     # Trainer
-    trainer = L.Trainer(max_epochs=100, default_root_dir=default_root_dir,
-                        log_every_n_steps=40, callbacks=callbacks)
+    trainer = pl.Trainer(max_epochs=100, default_root_dir=default_root_dir,
+                         log_every_n_steps=40, callbacks=callbacks)
     # Fit
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 else:
-    if input('Load model? [y/N]: ').lower() == 'y':
+    if input('Load model from checkpoint file? [Y/n]: ').lower() != 'n':
         ckpt_path = input('Enter path to model checkpoint: ')
         if ckpt_path:
             model = FasterRCNNLightning.load_from_checkpoint(ckpt_path)
 
-# Test results
-# Set model to eval and freeze
-model.eval()
-model.freeze()
-# Predict and Calculate
-tp, fp, fn = 0, 0, 0
-ious_all, ious_indices = [], []
-outputs_all, targets_all = [], []
-for images, targets in test_loader:
-    # Predict outputs
-    outputs = model(images)
-    # Calculate metrics
-    for output, target in zip(outputs, targets):
-        gt_ious = box_iou(output['boxes'], target['boxes'])
-        best_ious, ious_idx = gt_ious.max(1)
-        ious_all.append(best_ious)
-        ious_indices.append(ious_idx)
-        outputs_all.append({'labels': output['labels']})
-        targets_all.append({'labels': target['labels']})
+# Test and metrics
+trainer = pl.Trainer()
+trainer.test(model=model, dataloaders=test_loader)
 
-# Plot data
-f1_plot = [[], []] # (threshold, f1)
-recall_precision_plot = [[], []] # (recall, precision)
-# Calculate for each threshold
-thresholds = np.arange(0, 1, step=0.1) # Reduce step for finer plot
-for threshold in thresholds:
-    for best_ious, ious_idx, output, target in zip(ious_all, ious_indices, outputs_all, targets_all):
-        for iou, iou_idx in zip(best_ious, ious_idx):
-            if iou > threshold:
-                if output['labels'][iou_idx] == target['labels'][iou_idx]:
-                    # True positive
-                    tp += 1
-                else:
-                    # False positive
-                    fp += 1
-            else:
-                # Missed
-                fn += 1
-    # Calculate F1 for current threshold
-    precision = tp / (tp + fp)
-    recall = tp / (tp + fn)
-    f1 = 2 * precision * recall / (precision + recall)
-    # Save to array for future plotting
-    f1_plot[0].append(threshold)
-    f1_plot[1].append(f1)
-    recall_precision_plot[0].append(recall)
-    recall_precision_plot[1].append(precision)
-
-# Plot the results
-plt.subplot(1, 2, 1)
-plt.scatter(f1_plot[0], f1_plot[1])
-plt.title('x: Threshold - y: F1 Score')
-plt.subplot(1, 2, 2)
-plt.scatter(recall_precision_plot[0], recall_precision_plot[1])
-plt.title('x: Recall - y: Precision')
+#DEBUG
+dataset = DentalDataset('test', 'test.json')
+data = dataset.get_image_by_id('26')
+visualize(data[0], data[1])
