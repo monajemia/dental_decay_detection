@@ -15,14 +15,15 @@ import imageio.v2 as imageio
 import lightning as pl
 import numpy as np
 import torch
-from lightning.pytorch.callbacks import early_stopping
+from lightning.pytorch.callbacks import early_stopping, ModelCheckpoint
 from matplotlib import pyplot as plt
 from torch import optim, tensor
 from torch.utils.data import Dataset, DataLoader, dataloader
 from torchmetrics import PrecisionRecallCurve
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNN_ResNet50_FPN_Weights
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, fasterrcnn_resnet50_fpn_v2
+from torchvision.models.detection.faster_rcnn import (FastRCNNPredictor, FasterRCNN_ResNet50_FPN_Weights,
+                                                      FasterRCNN_ResNet50_FPN_V2_Weights)
 from torchvision.ops import box_area, box_iou
 from torchvision.transforms import v2 as transforms
 from torchvision.tv_tensors import BoundingBoxes
@@ -32,23 +33,25 @@ from torchvision.utils import draw_bounding_boxes
 train_dir, train_json = 'train', 'train.json'
 val_dir, val_json = 'val', 'val.json'
 test_dir, test_json = 'test', 'test.json'
-num_classes: int = 3  # Output classes of objects to be predicted; Either 3 or 6
+num_classes: int = 6  # Output classes of objects to be predicted; Either 3 or 6
+base_model = 'resnet2'
 # Other
 labels_metrics_all_json = 'labels_metrics_all.json'
 
 # Model Parameters
+iou_threshold = 0.3
 mean, std = [0.485], [0.229]
 image_target_dims = [512, 512]  # Square is better!
 scheduled_lr = False
-batch_size = 7
+batch_size = 1  # 7 for resnet, 1 for resnet2
 lr = 1e-5
 num_workers = multiprocessing.cpu_count()
 
 default_root_dir = './'
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Work in progress...
-# - mAP and other metrics calculation
+# *** Bugs ***
+# - Have to turn off GPU to run manual metrics calculations section
 
 torch.set_float32_matmul_precision('medium')
 
@@ -212,18 +215,20 @@ test_loader = DataLoader(test_data, collate_fn=custom_collate, shuffle=False,
 
 
 class FasterRCNNLightning(pl.LightningModule):
-    def __init__(self, num_classes=num_classes, lr=lr, batch_size=batch_size):
+    def __init__(self, num_classes=num_classes, lr=lr, batch_size=batch_size, base_model=base_model):
         super().__init__()
         self.num_classes = num_classes
         self.lr = lr  # learning rate
         self.batch_size = batch_size
-        self.model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+        if base_model == 'resnet':
+            self.model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+        elif base_model == 'resnet2':
+            self.model = fasterrcnn_resnet50_fpn_v2(weights=FasterRCNN_ResNet50_FPN_V2_Weights.DEFAULT)
         in_features = self.model.roi_heads.box_predictor.cls_score.in_features
         self.model.roi_heads.box_predictor = FastRCNNPredictor(in_features,
                                                                self.num_classes + 1)
         self.iou_thresholds = list(np.arange(0.1, 1.0, 0.1))  # Change for finer charts
-        self.mAP = MeanAveragePrecision(iou_thresholds=[0.1])
-        self.pr_curve = PrecisionRecallCurve(task='multiclass', num_classes=self.num_classes)
+        self.mAP = MeanAveragePrecision(iou_thresholds=[0.1, 0.2, 0.3])
 
     def training_step(self, batch, batch_idx):
         images, targets = batch
@@ -248,21 +253,12 @@ class FasterRCNNLightning(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         global cls_logits
         images, targets = batch
-
-        # Get cls_score logits for PR curve
-        def get_cls_logits(module, input, output):
-            global cls_logits
-            cls_logits = output
-
-        cls_score_layer = self.model.roi_heads.box_predictor.cls_score
-        hook = cls_score_layer.register_forward_hook(get_cls_logits)
         outputs = self(images)
-        hook.remove()
         # Test metrics
         self.mAP.update(outputs, targets)
-        # print(cls_logits)
-        # for output, target in zip(outputs, targets):
-        #     self.pr_curve.update(output['labels'], target['labels'])
+
+    def on_test_end(self) -> None:
+        print(self.mAP.compute())
 
     def forward(self, images):
         return self.model(images)
@@ -352,7 +348,9 @@ model = FasterRCNNLightning()
 # Train the model
 if input('Train the model? [y/N]: ').lower() == 'y':
     # Callbacks
-    callbacks = [early_stopping.EarlyStopping(monitor='val_loss', mode='min', patience=30)]
+    callbacks = [early_stopping.EarlyStopping(monitor='val_loss', mode='min', patience=10),
+                 ModelCheckpoint(monitor='val_loss', mode='min', save_top_k=1,
+                                 dirpath=os.path.join(default_root_dir, 'lightning_logs'), filename='{epoch}')]
     # Trainer
     trainer = pl.Trainer(max_epochs=200, default_root_dir=default_root_dir,
                          log_every_n_steps=40, callbacks=callbacks)
@@ -369,95 +367,98 @@ if input('Do test? [y/N]: ').lower() == 'y':
     trainer = pl.Trainer()
     trainer.test(model=model, dataloaders=test_loader)
 
-if input('Step into manual test metrics? [y/N]: ') == 'y':
-    # Manual Test metrics
-    # Set model to eval and freeze
-    model.eval()
-    model.freeze()
-    # Predict and Calculate
-    tp, fp, fn = 0, 0, 0
-    outputs_all, targets_all = [], []
-    for images, targets in test_loader:
-        # Predict outputs
-        with torch.no_grad():
-            outputs = model(images)
-        # Pack outputs and targets
-        outputs_all.extend(outputs)
-        targets_all.extend(targets)
-
-    # Plot data
-    labels = [str(label) for label in range(1, num_classes + 1)] # Class names
+prompt_manual_metrics = input('Do manual metrics calculations? (S: show from previous JSON) [y/N/s]: ').lower()
+if prompt_manual_metrics == 'y' or prompt_manual_metrics == 's':
+    # Basic plot data variables
+    labels = [str(label) for label in range(1, num_classes + 1)]  # Class names
     labels_metrics_all = []  # For each threshold
     f1_plot = [[], []]  # (threshold, f1)
     recall_precision_plot = [[], []]  # (recall, precision)
     # Confidence thresholds ('score')
     thresholds = np.arange(0, 1, step=0.1)
-    iou_threshold = 0.3
 
-    # Calculate metrics for each threshold
-    for threshold in thresholds:
-        # Labels
-        labels_metrics = {'all': {'tn': 0}}
-        for label in labels:
-            labels_metrics[label] = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0, 'R': 0, 'P': 0}  # R: Recall P: Precision
+    if prompt_manual_metrics == 'y':
+        # Manual Test metrics
+        # Set model to eval and freeze
+        model.eval()
+        model.freeze()
+        # Predict and Calculate
+        tp, fp, fn = 0, 0, 0
+        outputs_all, targets_all = [], []
+        for images, targets in test_loader:
+            # Predict outputs
+            with torch.no_grad():
+                outputs = model(images.to(device))
+            # Pack outputs and targets
+            outputs_all.extend(outputs)
+            targets_all.extend(targets)
 
-        for output, target in zip(outputs_all, targets_all):
-            # Apply confidence threshold
-            mask = output['scores'] > threshold
-            output['boxes'], output['labels'], output['scores'] = (output['boxes'][mask], output['labels'][mask],
-                                                                   output['scores'][mask])
+        # Calculate metrics for each threshold
+        for threshold in thresholds:
+            # Labels
+            labels_metrics = {'all': {'tn': 0}}
+            for label in labels:
+                labels_metrics[label] = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0, 'R': 0, 'P': 0}  # R: Recall P: Precision
 
-            # Match boxes based on IoUs
-            gt_ious_1 = box_iou(output['boxes'], target['boxes'])
-            best_ious_1, ious_idx_1 = gt_ious_1.max(1)
-            # I wrote this twice because sometimes the returned indexes were more than there was data in target/output
-            # I think it's a bug in torch ops
-            # INSPECT LATER
-            gt_ious_2 = box_iou(target['boxes'], output['boxes'])
-            best_ious_2, ious_idx_2 = gt_ious_2.max(1)
-            if ious_idx_1.max() > ious_idx_2.max():
-                best_ious, ious_idx = best_ious_2, ious_idx_2
-            else:
-                best_ious, ious_idx = best_ious_1, ious_idx_1
-
-            # Count tp, tn, fp, fn based on iou and label
-            for iou, iou_idx in zip(best_ious, ious_idx):
-                label = str(target['labels'][iou_idx].numpy())
-                if iou > iou_threshold:
-                    if output['labels'][iou_idx] == target['labels'][iou_idx]:
-                        # True positive
-                        labels_metrics[label]['tp'] += 1
-                        # Other classes, true negative
-                        labels_metrics['all']['tn'] += 1
-                        labels_metrics[label]['tn'] -= 1
-                    else:
-                        # False positive
-                        labels_metrics[label]['fp'] += 1
+            for output, target in zip(outputs_all, targets_all):
+                mask = output['scores'] > threshold
+                output['boxes'] = output['boxes'][mask]
+                output['labels'] = output['labels'][mask]
+                output['scores'] = output['scores'][mask]
+                # Match boxes based on IoUs
+                gt_ious = box_iou(target['boxes'].to(device), output['boxes'].to(device))
+                if gt_ious.shape[1] != 0 and gt_ious.shape[0] == len(target['labels']):
+                    best_ious, ious_idx = gt_ious.max(1)
+                    # Count tp, tn, fp, fn based on iou and label
+                    for iou, iou_idx, target_iou_idx in zip(best_ious, ious_idx, range(len(ious_idx))):
+                        label = str(target['labels'][target_iou_idx].numpy())
+                        if iou > iou_threshold:
+                            if output['labels'][iou_idx] == target['labels'][target_iou_idx]:
+                                # True positive
+                                labels_metrics[label]['tp'] += 1
+                                # Other classes, true negative
+                                labels_metrics['all']['tn'] += 1
+                                labels_metrics[label]['tn'] -= 1
+                            else:
+                                # False positive
+                                labels_metrics[label]['fp'] += 1
+                        else:
+                            # Missed
+                            labels_metrics[label]['fn'] += 1
+                elif gt_ious.shape[1] != 0 and gt_ious.shape(0) < len(target['labels']):
+                    raise Exception('IoU result happened to have less returns than target labels length!')
                 else:
-                    # Missed
-                    labels_metrics[label]['fn'] += 1
+                    # Missed everything
+                    for label in target['labels']:
+                        label = str(label.numpy())
+                        labels_metrics[label]['fn'] += 1
 
-        # Calculate F1 for current threshold for each class
-        for label in labels:
-            labels_metrics[label]['tn'] = labels_metrics['all']['tn'] + labels_metrics[label]['tn']
-            tp, tn, fp, fn = (labels_metrics[label]['tp'], labels_metrics[label]['tn'], labels_metrics[label]['fp'],
-                              labels_metrics[label]['fn'])
-            try:
-                precision = tp / (tp + fp)
-            except ZeroDivisionError:
-                precision = None
-            try:
-                recall = tp / (tp + fn)
-            except ZeroDivisionError:
-                recall = None
-            labels_metrics[label]['P'] = precision
-            labels_metrics[label]['R'] = recall
-        labels_metrics.pop('all')
-        labels_metrics_all.append([threshold, labels_metrics])
+            # Calculate F1 for current threshold for each class
+            for label in labels:
+                labels_metrics[label]['tn'] = labels_metrics['all']['tn'] + labels_metrics[label]['tn']
+                tp, tn, fp, fn = (labels_metrics[label]['tp'], labels_metrics[label]['tn'], labels_metrics[label]['fp'],
+                                  labels_metrics[label]['fn'])
+                try:
+                    precision = tp / (tp + fp)
+                except ZeroDivisionError:
+                    precision = None
+                try:
+                    recall = tp / (tp + fn)
+                except ZeroDivisionError:
+                    recall = None
+                labels_metrics[label]['P'] = precision
+                labels_metrics[label]['R'] = recall
+            labels_metrics.pop('all')
+            labels_metrics_all.append([threshold, labels_metrics])
 
-    # Save to file for later use in case needed
-    with open(labels_metrics_all_json, 'w') as fh:
-        json.dump(labels_metrics_all, fh)
+        # Save to file for later use in case needed
+        with open(labels_metrics_all_json, 'w') as fh:
+            json.dump(labels_metrics_all, fh)
+
+    # Load previous calculated JSON to save time
+    if prompt_manual_metrics == 's':
+        with open(labels_metrics_all_json) as fh:
+            labels_metrics_all = json.load(fh)
 
     # Precision Recall plotting
     precision = {}
@@ -474,7 +475,8 @@ if input('Step into manual test metrics? [y/N]: ') == 'y':
     plt.title('Precision-Recall Curve')
     plt.legend()
     plt.grid(True)
-
+    print('Precision: ', precision)
+    print('Recall: ', recall)
 
 # DEBUG
 dataset = DentalDataset(train_dir, train_json)
