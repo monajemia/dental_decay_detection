@@ -376,36 +376,54 @@ if input('Step into manual test metrics? [y/N]: ') == 'y':
     model.freeze()
     # Predict and Calculate
     tp, fp, fn = 0, 0, 0
-    ious_all, ious_indices = [], []
     outputs_all, targets_all = [], []
     for images, targets in test_loader:
         # Predict outputs
-        outputs = model(images)
-        # Calculate metrics
-        for output, target in zip(outputs, targets):
-            gt_ious = box_iou(output['boxes'], target['boxes'])
-            best_ious, ious_idx = gt_ious.max(1)
-            ious_all.append(best_ious)
-            ious_indices.append(ious_idx)
-            outputs_all.append({'labels': output['labels']})
-            targets_all.append({'labels': target['labels']})
+        with torch.no_grad():
+            outputs = model(images)
+        # Pack outputs and targets
+        outputs_all.extend(outputs)
+        targets_all.extend(targets)
 
     # Plot data
     labels = [str(label) for label in range(1, num_classes + 1)] # Class names
     labels_metrics_all = []  # For each threshold
     f1_plot = [[], []]  # (threshold, f1)
     recall_precision_plot = [[], []]  # (recall, precision)
-    # Calculate for each threshold
-    thresholds = np.arange(0, 1, step=0.1)  # Reduce step for finer plot
-    for threshold in thresholds:
-        labels_metrics = {'all': {'tn': 0}}
-        for i in range(1, num_classes + 1):
-            labels_metrics[str(i)] = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0, 'R':0, 'P': 0}  # R: Recall P: Precision
+    # Confidence thresholds ('score')
+    thresholds = np.arange(0, 1, step=0.1)
+    iou_threshold = 0.3
 
-        for best_ious, ious_idx, output, target in zip(ious_all, ious_indices, outputs_all, targets_all):
+    # Calculate metrics for each threshold
+    for threshold in thresholds:
+        # Labels
+        labels_metrics = {'all': {'tn': 0}}
+        for label in labels:
+            labels_metrics[label] = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0, 'R': 0, 'P': 0}  # R: Recall P: Precision
+
+        for output, target in zip(outputs_all, targets_all):
+            # Apply confidence threshold
+            mask = output['scores'] > threshold
+            output['boxes'], output['labels'], output['scores'] = (output['boxes'][mask], output['labels'][mask],
+                                                                   output['scores'][mask])
+
+            # Match boxes based on IoUs
+            gt_ious_1 = box_iou(output['boxes'], target['boxes'])
+            best_ious_1, ious_idx_1 = gt_ious_1.max(1)
+            # I wrote this twice because sometimes the returned indexes were more than there was data in target/output
+            # I think it's a bug in torch ops
+            # INSPECT LATER
+            gt_ious_2 = box_iou(target['boxes'], output['boxes'])
+            best_ious_2, ious_idx_2 = gt_ious_2.max(1)
+            if ious_idx_1.max() > ious_idx_2.max():
+                best_ious, ious_idx = best_ious_2, ious_idx_2
+            else:
+                best_ious, ious_idx = best_ious_1, ious_idx_1
+
+            # Count tp, tn, fp, fn based on iou and label
             for iou, iou_idx in zip(best_ious, ious_idx):
                 label = str(target['labels'][iou_idx].numpy())
-                if iou > threshold:
+                if iou > iou_threshold:
                     if output['labels'][iou_idx] == target['labels'][iou_idx]:
                         # True positive
                         labels_metrics[label]['tp'] += 1
