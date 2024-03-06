@@ -5,36 +5,36 @@ Data loader
 
 @author: arman
 """
-from typing import Any
 
+import json
+import multiprocessing
+import os
+from collections import OrderedDict
+
+import imageio.v2 as imageio
+import lightning as pl
+import numpy as np
 import torch
-from lightning.pytorch.utilities.types import STEP_OUTPUT
+from lightning.pytorch.callbacks import early_stopping
+from matplotlib import pyplot as plt
 from torch import optim, tensor
 from torch.utils.data import Dataset, DataLoader, dataloader
-import json
-from collections import OrderedDict
-import imageio.v2 as imageio
-import os
-import lightning as pl
-from lightning.pytorch.callbacks import early_stopping
+from torchmetrics import PrecisionRecallCurve
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor, FasterRCNN_ResNet50_FPN_Weights
-from torchvision.transforms import v2 as transforms
-from torchvision.utils import draw_bounding_boxes
 from torchvision.ops import box_area, box_iou
-import pickle
-import torchvision
-import numpy as np
-from matplotlib import pyplot as plt
+from torchvision.transforms import v2 as transforms
 from torchvision.tv_tensors import BoundingBoxes
-import multiprocessing
-from torchmetrics.detection.mean_ap import MeanAveragePrecision
+from torchvision.utils import draw_bounding_boxes
 
 # Input Parameters (CHANGE)
 train_dir, train_json = 'train', 'train.json'
 val_dir, val_json = 'val', 'val.json'
 test_dir, test_json = 'test', 'test.json'
 num_classes: int = 3  # Output classes of objects to be predicted; Either 3 or 6
+# Other
+labels_metrics_all_json = 'labels_metrics_all.json'
 
 # Model Parameters
 mean, std = [0.485], [0.229]
@@ -86,6 +86,7 @@ class DentalDataset(Dataset):
         self.images_dir = images_dir
         self.images_ext = images_ext
         self.augmentation = augmentation
+        self.num_classes = num_classes
 
     def __len__(self):
         return len(self.image_annotations.keys())
@@ -101,16 +102,17 @@ class DentalDataset(Dataset):
         image, target = self.transform(image, target)
 
         # Classes: 3 or 6; For better performance, sometimes need to choose 3 class, merging
-        new_labels = []
-        for label in target['labels']:
-            if label <= 3:
-                label = 1
-            elif label == 4:
-                label = 2
-            elif label > 4:
-                label = 3
-            new_labels.append(label)
-        target['labels'] = torch.tensor(new_labels)
+        if self.num_classes == 3:
+            new_labels = []
+            for label in target['labels']:
+                if label <= 3:
+                    label = 1
+                elif label == 4:
+                    label = 2
+                elif label > 4:
+                    label = 3
+                new_labels.append(label)
+            target['labels'] = torch.tensor(new_labels)
 
         return image, target
 
@@ -141,7 +143,7 @@ class DentalDataset(Dataset):
         if self.augmentation:
             # normalize commented out, unnecessary as these models do it internally
             transform_compose = transforms.Compose([
-                transforms.RandomRotation(degrees=5),
+                # transforms.RandomRotation(degrees=5),
                 # transforms.RandomAdjustSharpness(sharpness_factor=2),
                 transforms.ColorJitter(brightness=0.1, contrast=0.1),
                 transforms.RandomHorizontalFlip(),
@@ -219,7 +221,9 @@ class FasterRCNNLightning(pl.LightningModule):
         in_features = self.model.roi_heads.box_predictor.cls_score.in_features
         self.model.roi_heads.box_predictor = FastRCNNPredictor(in_features,
                                                                self.num_classes + 1)
-        self.mAP = MeanAveragePrecision(iou_thresholds=list(np.arange(0.0, 1.0, 0.1)))
+        self.iou_thresholds = list(np.arange(0.1, 1.0, 0.1))  # Change for finer charts
+        self.mAP = MeanAveragePrecision(iou_thresholds=[0.1])
+        self.pr_curve = PrecisionRecallCurve(task='multiclass', num_classes=self.num_classes)
 
     def training_step(self, batch, batch_idx):
         images, targets = batch
@@ -242,10 +246,23 @@ class FasterRCNNLightning(pl.LightningModule):
         return losses
 
     def test_step(self, batch, batch_idx):
+        global cls_logits
         images, targets = batch
+
+        # Get cls_score logits for PR curve
+        def get_cls_logits(module, input, output):
+            global cls_logits
+            cls_logits = output
+
+        cls_score_layer = self.model.roi_heads.box_predictor.cls_score
+        hook = cls_score_layer.register_forward_hook(get_cls_logits)
         outputs = self(images)
+        hook.remove()
         # Test metrics
         self.mAP.update(outputs, targets)
+        # print(cls_logits)
+        # for output, target in zip(outputs, targets):
+        #     self.pr_curve.update(output['labels'], target['labels'])
 
     def forward(self, images):
         return self.model(images)
@@ -262,7 +279,7 @@ class FasterRCNNLightning(pl.LightningModule):
 
 
 def visualize(image, targets=None, preds=None, threshold=None):
-    image = image * std[0] + mean[0] # Un-normalize
+    image = image * std[0] + mean[0]  # Un-normalize
     image = torch.as_tensor(image, dtype=torch.uint8)
     if image.ndim < 3:
         image = image.unsqueeze(0)
@@ -277,7 +294,7 @@ def visualize(image, targets=None, preds=None, threshold=None):
         if threshold:
             mask = preds['scores'] > threshold
             boxes, labels = boxes[mask], labels[mask]
-            labels = [str(x.numpy()) for x in labels] # To string, for plot labels
+            labels = [str(x.numpy()) for x in labels]  # To string, for plot labels
             preds_to_show = draw_bounding_boxes(image, boxes=boxes, labels=labels)
         else:
             labels = [str(x.numpy()) for x in labels]
@@ -329,6 +346,7 @@ def visualize(image, targets=None, preds=None, threshold=None):
         plt.title('Input')
         plt.show()
 
+
 model = FasterRCNNLightning()
 
 # Train the model
@@ -336,7 +354,7 @@ if input('Train the model? [y/N]: ').lower() == 'y':
     # Callbacks
     callbacks = [early_stopping.EarlyStopping(monitor='val_loss', mode='min', patience=30)]
     # Trainer
-    trainer = pl.Trainer(max_epochs=100, default_root_dir=default_root_dir,
+    trainer = pl.Trainer(max_epochs=200, default_root_dir=default_root_dir,
                          log_every_n_steps=40, callbacks=callbacks)
     # Fit
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
@@ -347,10 +365,103 @@ else:
             model = FasterRCNNLightning.load_from_checkpoint(ckpt_path)
 
 # Test and metrics
-trainer = pl.Trainer()
-trainer.test(model=model, dataloaders=test_loader)
+if input('Do test? [y/N]: ').lower() == 'y':
+    trainer = pl.Trainer()
+    trainer.test(model=model, dataloaders=test_loader)
 
-#DEBUG
-dataset = DentalDataset('test', 'test.json')
-data = dataset.get_image_by_id('26')
-visualize(data[0], data[1])
+if input('Step into manual test metrics? [y/N]: ') == 'y':
+    # Manual Test metrics
+    # Set model to eval and freeze
+    model.eval()
+    model.freeze()
+    # Predict and Calculate
+    tp, fp, fn = 0, 0, 0
+    ious_all, ious_indices = [], []
+    outputs_all, targets_all = [], []
+    for images, targets in test_loader:
+        # Predict outputs
+        outputs = model(images)
+        # Calculate metrics
+        for output, target in zip(outputs, targets):
+            gt_ious = box_iou(output['boxes'], target['boxes'])
+            best_ious, ious_idx = gt_ious.max(1)
+            ious_all.append(best_ious)
+            ious_indices.append(ious_idx)
+            outputs_all.append({'labels': output['labels']})
+            targets_all.append({'labels': target['labels']})
+
+    # Plot data
+    labels = [str(label) for label in range(1, num_classes + 1)] # Class names
+    labels_metrics_all = []  # For each threshold
+    f1_plot = [[], []]  # (threshold, f1)
+    recall_precision_plot = [[], []]  # (recall, precision)
+    # Calculate for each threshold
+    thresholds = np.arange(0, 1, step=0.1)  # Reduce step for finer plot
+    for threshold in thresholds:
+        labels_metrics = {'all': {'tn': 0}}
+        for i in range(1, num_classes + 1):
+            labels_metrics[str(i)] = {'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0, 'R':0, 'P': 0}  # R: Recall P: Precision
+
+        for best_ious, ious_idx, output, target in zip(ious_all, ious_indices, outputs_all, targets_all):
+            for iou, iou_idx in zip(best_ious, ious_idx):
+                label = str(target['labels'][iou_idx].numpy())
+                if iou > threshold:
+                    if output['labels'][iou_idx] == target['labels'][iou_idx]:
+                        # True positive
+                        labels_metrics[label]['tp'] += 1
+                        # Other classes, true negative
+                        labels_metrics['all']['tn'] += 1
+                        labels_metrics[label]['tn'] -= 1
+                    else:
+                        # False positive
+                        labels_metrics[label]['fp'] += 1
+                else:
+                    # Missed
+                    labels_metrics[label]['fn'] += 1
+
+        # Calculate F1 for current threshold for each class
+        for label in labels:
+            labels_metrics[label]['tn'] = labels_metrics['all']['tn'] + labels_metrics[label]['tn']
+            tp, tn, fp, fn = (labels_metrics[label]['tp'], labels_metrics[label]['tn'], labels_metrics[label]['fp'],
+                              labels_metrics[label]['fn'])
+            try:
+                precision = tp / (tp + fp)
+            except ZeroDivisionError:
+                precision = None
+            try:
+                recall = tp / (tp + fn)
+            except ZeroDivisionError:
+                recall = None
+            labels_metrics[label]['P'] = precision
+            labels_metrics[label]['R'] = recall
+        labels_metrics.pop('all')
+        labels_metrics_all.append([threshold, labels_metrics])
+
+    # Save to file for later use in case needed
+    with open(labels_metrics_all_json, 'w') as fh:
+        json.dump(labels_metrics_all, fh)
+
+    # Precision Recall plotting
+    precision = {}
+    recall = {}
+    for label in labels:
+        precision[label], recall[label] = [], []
+        for threshold_idx in range(len(thresholds)):
+            precision[label].append(labels_metrics_all[threshold_idx][1][label]['P'])
+            recall[label].append(labels_metrics_all[threshold_idx][1][label]['R'])
+            # Draw plot for label
+        plt.plot(recall[label], precision[label], label=label)
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve')
+    plt.legend()
+    plt.grid(True)
+
+
+# DEBUG
+dataset = DentalDataset(train_dir, train_json)
+train_data = DentalDataset(train_dir, train_json, augmentation=True)
+aug = train_data.get_image_by_id('515')
+noaug = dataset.get_image_by_id('515')
+model.eval()
+pred = model.to('cpu')(aug[0].unsqueeze(0))
