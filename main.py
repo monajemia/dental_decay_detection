@@ -372,7 +372,6 @@ if prompt_manual_metrics == 'y' or prompt_manual_metrics == 's':
     # Basic plot data variables
     labels = [str(label) for label in range(1, num_classes + 1)]  # Class names
     labels_metrics_all = []  # For each threshold
-    f1_plot = [[], []]  # (threshold, f1)
     recall_precision_plot = [[], []]  # (recall, precision)
     # Confidence thresholds ('score')
     thresholds = np.arange(0, 1, step=0.1)
@@ -479,9 +478,11 @@ if prompt_manual_metrics == 'y' or prompt_manual_metrics == 's':
     print('Recall: ', recall)
 
 # DEBUG
-dataset = DentalDataset(train_dir, train_json)
 train_data = DentalDataset(train_dir, train_json, augmentation=True)
-aug = train_data.get_image_by_id('515')
-noaug = dataset.get_image_by_id('515')
+train_sample = train_data.get_image_by_id('515')
+val_sample = DentalDataset(val_dir, val_json).get_image_by_id('6')
+test_sample = DentalDataset(test_dir, test_json).get_image_by_id('26')
 model.eval()
-pred = model.to('cpu')(aug[0].unsqueeze(0))
+pred_train = model.to('cpu')(train_sample[0].unsqueeze(0))
+pred_val = model.to('cpu')(val_sample[0].unsqueeze(0))
+pred_test = model.to('cpu')(test_sample[0].unsqueeze(0))
